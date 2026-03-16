@@ -17,6 +17,7 @@ import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import com.google.android.material.floatingactionbutton.FloatingActionButton
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
@@ -30,18 +31,46 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var previewView: PreviewView
+    private lateinit var skeletonOverlay: SkeletonOverlayView
+    private lateinit var btnSwitchCamera: FloatingActionButton
     private lateinit var poseLandmarker: PoseLandmarker
+
     private var cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         setupEdgeToEdge()
-        initCameraExecutor()
-        previewView = findViewById(R.id.previewCam)
 
+        previewView      = findViewById(R.id.previewCam)
+        skeletonOverlay  = findViewById(R.id.skeletonOverlay)
+        btnSwitchCamera  = findViewById(R.id.btnSwitchCamera)
+
+        initCameraExecutor()
         requestCameraPermission()
+
+        btnSwitchCamera.setOnClickListener { switchCamera() }
     }
+
+    // ── Camera switching ──────────────────────────────────────────────────────
+
+    private fun switchCamera() {
+        cameraSelector = if (cameraSelector == CameraSelector.DEFAULT_BACK_CAMERA)
+            CameraSelector.DEFAULT_FRONT_CAMERA
+        else
+            CameraSelector.DEFAULT_BACK_CAMERA
+
+        // Animate the FAB rotation for tactile feedback
+        btnSwitchCamera.animate()
+            .rotationBy(180f)
+            .setDuration(300)
+            .start()
+
+        skeletonOverlay.clear()
+        setupCamera()
+    }
+
+    // ── Setup ─────────────────────────────────────────────────────────────────
 
     private fun setupEdgeToEdge() {
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main)) { v, insets ->
@@ -64,40 +93,57 @@ class MainActivity : AppCompatActivity() {
         val options = PoseLandmarker.PoseLandmarkerOptions.builder()
             .setBaseOptions(baseOptions)
             .setRunningMode(RunningMode.LIVE_STREAM)
-            .setResultListener { result, _ ->    //Todo: You will get landmarks here and use them for further processing
+            .setResultListener { result, inputImage ->
+                // Update the skeleton overlay on every frame
+                skeletonOverlay.updateLandmarks(result, inputImage.width, inputImage.height)
+
+                // Optional: log landmarks for debugging
                 var count = 0
                 result.landmarks().forEach { landmark ->
-                    landmark.forEach{
-                        Log.d("PoseLandmarks", "landmark: $count , x = ${it.x()}, y = ${it.y()}, z = ${it.z()}")
+                    landmark.forEach {
+                        Log.d("PoseLandmarks", "landmark: $count , x=${it.x()}, y=${it.y()}, z=${it.z()}")
                         count++
-                        //This will log all the pose landmarks in each frame
                     }
                 }
-            }.build()
+            }
+            .setErrorListener { error ->
+                Log.e("PoseLandmarker", "Error: ${error.message}")
+            }
+            .build()
+
         poseLandmarker = PoseLandmarker.createFromOptions(this, options)
     }
 
+    // ── Camera permission ─────────────────────────────────────────────────────
+
     private val cameraPermissionLauncher: ActivityResultLauncher<String> =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) setupCamera() else Toast.makeText(this, "Camera permission required", Toast.LENGTH_SHORT).show()
+            if (granted) setupCamera()
+            else Toast.makeText(this, "Camera permission required", Toast.LENGTH_SHORT).show()
         }
 
     private fun requestCameraPermission() {
-        if (hasCameraPermission()) setupCamera() else cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+        if (hasCameraPermission()) setupCamera()
+        else cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
     }
 
-    private fun hasCameraPermission(): Boolean {
-        return ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-    }
+    private fun hasCameraPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+
+    // ── Camera setup ──────────────────────────────────────────────────────────
 
     private fun setupCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
-            val preview = Preview.Builder().build().apply { setSurfaceProvider(previewView.surfaceProvider) }
+            val preview = Preview.Builder()
+                .build()
+                .apply { setSurfaceProvider(previewView.surfaceProvider) }
+
             val imageAnalyzer = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build().apply { setAnalyzer(cameraExecutor, ::analyzeImage) }
+                .build()
+                .apply { setAnalyzer(cameraExecutor, ::analyzeImage) }
 
             try {
                 cameraProvider.unbindAll()
@@ -108,6 +154,7 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    // ── Image analysis ────────────────────────────────────────────────────────
 
     @OptIn(ExperimentalGetImage::class)
     private fun analyzeImage(imageProxy: ImageProxy) {
@@ -115,18 +162,23 @@ class MainActivity : AppCompatActivity() {
         if (mediaImage != null && imageProxy.format == ImageFormat.YUV_420_888) {
             val bitmap = yuvToRgb(mediaImage, imageProxy)
             val mpImage: MPImage
-            if (cameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA){
+
+            if (cameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA) {
                 val matrix = Matrix().apply {
                     postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
-                    postScale(-1f, 1f, bitmap.width.toFloat(), bitmap.height.toFloat()) // Mirror flip
+                    postScale(-1f, 1f, bitmap.width / 2f, bitmap.height / 2f)
                 }
                 val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
                 mpImage = BitmapImageBuilder(rotatedBitmap).build()
             } else {
-                mpImage = BitmapImageBuilder(bitmap).build()
+                val matrix = Matrix().apply {
+                    postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+                }
+                val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+                mpImage = BitmapImageBuilder(rotatedBitmap).build()
             }
-            val timestamp = imageProxy.imageInfo.timestamp
-            poseLandmarker.detectAsync(mpImage, timestamp)
+
+            poseLandmarker.detectAsync(mpImage, imageProxy.imageInfo.timestamp)
             imageProxy.close()
         } else {
             Log.e("AnalyzeImage", "Unsupported image format")
@@ -135,9 +187,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun yuvToRgb(image: Image, imageProxy: ImageProxy): Bitmap {
-        val yBuffer = image.planes[0].buffer // Y
-        val uBuffer = image.planes[1].buffer // U
-        val vBuffer = image.planes[2].buffer // V
+        val yBuffer = image.planes[0].buffer
+        val uBuffer = image.planes[1].buffer
+        val vBuffer = image.planes[2].buffer
         val ySize = yBuffer.remaining()
         val uSize = uBuffer.remaining()
         val vSize = vBuffer.remaining()
@@ -148,14 +200,15 @@ class MainActivity : AppCompatActivity() {
         val yuvImage = YuvImage(nv21, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
         val out = ByteArrayOutputStream()
         yuvImage.compressToJpeg(Rect(0, 0, imageProxy.width, imageProxy.height), 100, out)
-        val imageBytes = out.toByteArray()
-        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+        val bytes = out.toByteArray()
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
     }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onDestroy() {
         super.onDestroy()
         cameraExecutor.shutdown()
         poseLandmarker.close()
     }
-
 }
